@@ -313,6 +313,9 @@ HF_HUB_ETAG_TIMEOUT: int = _as_int(os.environ.get("HF_HUB_ETAG_TIMEOUT")) or DEF
 # Also used as a default timeout for other requests if not specified (kept the naming for legacy reasons)
 HF_HUB_DOWNLOAD_TIMEOUT: int = _as_int(os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT")) or DEFAULT_DOWNLOAD_TIMEOUT
 
+# Max number of parts uploaded concurrently when uploading a LFS file with the multipart upload protocol
+HF_HUB_MULTIPART_UPLOAD_MAX_WORKERS: int = _as_int(os.environ.get("HF_HUB_MULTIPART_UPLOAD_MAX_WORKERS")) or 8
+
 # Allows to add information about the requester in the user-agent (e.g. partner name)
 HF_HUB_USER_AGENT_ORIGIN: str | None = os.environ.get("HF_HUB_USER_AGENT_ORIGIN")
 

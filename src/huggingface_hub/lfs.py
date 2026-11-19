@@ -13,11 +13,16 @@
 # limitations under the License.
 """Git LFS related type definitions and utilities"""
 
+import hashlib
 import io
+import json
+import os
 import re
+import threading
 from collections.abc import Iterable
 from math import ceil
 from os.path import getsize
+from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypedDict
 from urllib.parse import unquote
 
@@ -27,6 +32,7 @@ from .utils import (
     build_hf_headers,
     fix_hf_endpoint_in_url,
     hf_raise_for_status,
+    hf_thread_map,
     http_backoff,
     logging,
     validate_hf_hub_args,
@@ -371,24 +377,67 @@ def _upload_single_part(operation: "CommitOperationAdd", upload_url: str) -> Non
 def _upload_multi_part(operation: "CommitOperationAdd", header: dict, chunk_size: int, upload_url: str) -> None:
     """
     Uploads file using HF multipart LFS transfer protocol.
-    """
-    # 1. Get upload URLs for each part
-    sorted_parts_urls = _get_sorted_parts_urls(header=header, upload_info=operation.upload_info, chunk_size=chunk_size)
 
-    # 2. Upload parts (pure Python)
-    response_headers = _upload_parts_iteratively(
-        operation=operation, sorted_parts_urls=sorted_parts_urls, chunk_size=chunk_size
-    )
+    Parts are uploaded concurrently (see `HF_HUB_MULTIPART_UPLOAD_MAX_WORKERS`) and each part is
+    verified against its MD5 hash. Progress is persisted locally (keyed by the file's SHA256) so
+    that an interrupted upload can be resumed without re-uploading the parts that already went
+    through.
+    """
+    upload_info = operation.upload_info
+    oid = upload_info.sha256.hex()
+
+    # 1. Get upload URLs for each part
+    sorted_parts_urls = _get_sorted_parts_urls(header=header, upload_info=upload_info, chunk_size=chunk_size)
+
+    # 2. Upload missing parts, resuming from a previous interrupted attempt if any
+    completed_parts = _load_completed_parts(oid=oid, size=upload_info.size, chunk_size=chunk_size)
+    if completed_parts:
+        logger.info(f"Resuming upload of {operation.path_in_repo}: {len(completed_parts)} parts already uploaded.")
+    state_lock = threading.Lock()
+
+    def _upload_and_persist_part(part_idx: int) -> None:
+        etag = _upload_part(
+            operation=operation,
+            part_upload_url=sorted_parts_urls[part_idx],
+            part_idx=part_idx,
+            chunk_size=chunk_size,
+        )
+        with state_lock:
+            completed_parts[part_idx] = etag
+            _save_completed_parts(
+                oid=oid, size=upload_info.size, chunk_size=chunk_size, completed_parts=completed_parts
+            )
+
+    remaining_parts = [part_idx for part_idx in range(len(sorted_parts_urls)) if part_idx not in completed_parts]
+    if remaining_parts:
+        # Uploading from a path or bytes is thread-safe (each part opens its own file handle). When
+        # uploading from a user-provided file object, fall back to sequential uploads since the
+        # object cannot be read concurrently.
+        max_workers = (
+            constants.HF_HUB_MULTIPART_UPLOAD_MAX_WORKERS
+            if isinstance(operation.path_or_fileobj, (str, bytes, Path))
+            else 1
+        )
+        hf_thread_map(
+            _upload_and_persist_part,
+            remaining_parts,
+            max_workers=max_workers,
+            desc=f"Uploading {operation.path_in_repo}",
+            unit="part",
+        )
 
     # 3. Send completion request
     # NOTE: `upload_url` is the Hub completion endpoint (not the S3 upload URLs).
     completion_res = http_backoff(
         "POST",
         upload_url,
-        json=_get_completion_payload(response_headers, operation.upload_info.sha256.hex()),
+        json=_get_completion_payload([{"etag": completed_parts[idx]} for idx in range(len(sorted_parts_urls))], oid),
         headers=LFS_HEADERS,
     )
     hf_raise_for_status(completion_res)
+
+    # 4. Upload completed => local resume state is not needed anymore
+    _delete_completed_parts(oid)
 
 
 def _get_sorted_parts_urls(header: dict, upload_info: UploadInfo, chunk_size: int) -> list[str]:
@@ -424,19 +473,86 @@ def _get_completion_payload(response_headers: list[dict], oid: str) -> Completio
     return {"oid": oid, "parts": parts}
 
 
-def _upload_parts_iteratively(
-    operation: "CommitOperationAdd", sorted_parts_urls: list[str], chunk_size: int
-) -> list[dict]:
-    headers = []
-    with operation.as_file(with_tqdm=True) as fileobj:
-        for part_idx, part_upload_url in enumerate(sorted_parts_urls):
-            with SliceFileObj(
-                fileobj,
-                seek_from=chunk_size * part_idx,
-                read_limit=chunk_size,
-            ) as fileobj_slice:
-                # S3 might raise a transient 500 error -> let's retry if that happens
-                part_upload_res = http_backoff("PUT", part_upload_url, data=fileobj_slice)
-                hf_raise_for_status(part_upload_res)
-                headers.append(part_upload_res.headers)
-    return headers  # type: ignore
+def _upload_part(operation: "CommitOperationAdd", part_upload_url: str, part_idx: int, chunk_size: int) -> str:
+    """
+    Uploads a single part of a multipart LFS upload and returns its etag.
+
+    The part content is hashed (MD5) while reading and verified against the etag returned by the
+    server, so that a corrupted part is detected immediately instead of failing the whole upload
+    at completion time. Transient network errors are retried with backoff by `http_backoff`.
+    """
+    seek_from = chunk_size * part_idx
+    with operation.as_file() as fileobj:
+        # 1. Hash the part content (read once from disk)
+        md5_hash = hashlib.md5()
+        with SliceFileObj(fileobj, seek_from=seek_from, read_limit=chunk_size) as fileobj_slice:
+            while chunk := fileobj_slice.read(8 * 1024 * 1024):
+                md5_hash.update(chunk)
+        expected_md5 = md5_hash.hexdigest()
+
+        # 2. Upload the part (read a second time, streamed). S3 might raise a transient 500
+        # error -> `http_backoff` retries and rewinds the slice before each attempt.
+        with SliceFileObj(fileobj, seek_from=seek_from, read_limit=chunk_size) as fileobj_slice:
+            part_upload_res = http_backoff("PUT", part_upload_url, data=fileobj_slice)
+            hf_raise_for_status(part_upload_res)
+
+    # 3. Verify the uploaded part against its hash. S3-compatible backends return the MD5 of the
+    # part as etag. If the etag is not MD5-shaped, we cannot verify anything -> skip the check.
+    etag = part_upload_res.headers.get("etag", "")
+    if re.fullmatch(r'"?[0-9a-f]{32}"?', etag) and etag.strip('"') != expected_md5:
+        raise ValueError(
+            f"Part {part_idx + 1} of '{operation.path_in_repo}' got corrupted during upload"
+            f" (expected MD5 {expected_md5}, got etag {etag}). Please retry."
+        )
+    return etag
+
+
+def _get_upload_state_path(oid: str) -> str:
+    """Path of the local file persisting the multipart upload state for a given file hash."""
+    return os.path.join(constants.HF_HUB_CACHE, "uploads", f"{oid}.json")
+
+
+def _load_completed_parts(oid: str, size: int, chunk_size: int) -> dict[int, str]:
+    """
+    Loads the parts uploaded by a previous interrupted attempt, if any.
+
+    The state is keyed by the file's SHA256 (`oid`) and only reused if the file size and chunk
+    size match, so parts of a different file or of a different upload session are never mixed up.
+    """
+    try:
+        with open(_get_upload_state_path(oid)) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if state.get("oid") != oid or state.get("size") != size or state.get("chunk_size") != chunk_size:
+        return {}
+    parts = state.get("parts")
+    if not isinstance(parts, dict):
+        return {}
+    return {int(part_num): etag for part_num, etag in parts.items()}
+
+
+def _save_completed_parts(oid: str, size: int, chunk_size: int, completed_parts: dict[int, str]) -> None:
+    """Persists the multipart upload state so that an interrupted upload can be resumed later."""
+    state_path = _get_upload_state_path(oid)
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        state = {
+            "oid": oid,
+            "size": size,
+            "chunk_size": chunk_size,
+            "parts": {str(part_num): etag for part_num, etag in sorted(completed_parts.items())},
+        }
+        with open(state_path + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.replace(state_path + ".tmp", state_path)
+    except OSError as e:
+        logger.debug(f"Could not persist multipart upload state to {state_path}: {e}")
+
+
+def _delete_completed_parts(oid: str) -> None:
+    """Deletes the persisted multipart upload state (called once the upload completed)."""
+    try:
+        os.remove(_get_upload_state_path(oid))
+    except OSError:
+        pass

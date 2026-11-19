@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid26925",
+  "B": "/home/dev/feedback/uid26925",
+  "sha": "23c13f517bd2e16ec44ded5887229fa9d2ae279d",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "huggingface",
+    "repo": "huggingface_hub",
+    "sha": "23c13f517bd2e16ec44ded5887229fa9d2ae279d"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "huggingface_hub",
+    "cloneUrl": "https://github.com/Rrr119/huggingface_hub.git"
+  },
+  "at": "2026-11-19T07:59:40.437Z"
+}

@@ -84,6 +84,10 @@ Integer value to define the number of seconds to wait for server response when f
 
 Integer value to define the number of seconds to wait for server response when downloading a file. If the request times out, a TimeoutError is raised. Setting a higher value is beneficial on machine with a slow connection. A smaller value makes the process fail quicker in case of complete network outage. Default to 10s.
 
+### HF_HUB_MULTIPART_UPLOAD_MAX_WORKERS
+
+Integer value to define how many parts are uploaded concurrently when uploading a large file with the LFS multipart protocol (used when `hf_xet` is disabled or not available on the server). Each part is verified against its MD5 hash and retried with backoff on transient errors. If the upload is interrupted, already-uploaded parts are persisted locally (keyed by the file's SHA256) and skipped on the next attempt. Defaults to 8.
+
 ## Xet 
 
 ### Other Xet environment variables
